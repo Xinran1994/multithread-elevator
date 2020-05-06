@@ -12,4 +12,5 @@ public:
 	passenger(chrono::system_clock::time_point generate_time, int id, int start_floor,int end_floor);
 	~passenger();
 	
+	void print_passenger();
 };
