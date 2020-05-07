@@ -4,7 +4,7 @@ This is CIS691 Multithreading(2020spring) final project in Syracuse Univeristy. 
 # Compile
 Using Vissual Studio 2019
 
-#Demo ScreenShots
+# Demo ScreenShots
 
 
 # Design
