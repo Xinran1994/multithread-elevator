@@ -159,6 +159,95 @@ void process_request(Elevator elevator, Passenger passenger, int time){
 
 }
 
+void tcp_connection(){
+        int port = 54000; 
+        //Initialize Window socket environment
+        WSAData data; 
+        WORD ver = MAKEWORD(2, 2);   t
+        int wsResult = WSAStartup(ver, &data); 
+        if (wsResult != 0) { // value 0 will be returned if the initialization succeeds.
+                cerr << "Can't start winsock, Err #" << wsResult << endl; 
+                WSACleanup(); //Clean up Windows socket environment.
+                return;
+        }
+        //create socket
+        SOCKET listening = socket(AF_INET, SOCK_STREAM, 0);
+        if (listening == INVALID_SOCKET) { //-1
+            cerr << "Can't create a socket" << endl;
+        }
+
+        //Bind the socket
+        sockaddr_in hint;
+        hint.sin_family = AF_INET;
+        hint.sin_port = htons(54000);
+        hint.sin_addr.s_addr = INADDR_ANY;
+        bind(listening, (sockaddr*)&hint, sizeof(hint));
+        listen(listening, SOMAXCONN);
+        
+        sockaddr_in client; 
+        int clientsize = sizeof(client);
+        SOCKET clientSocket = accept(listening, (sockaddr*)&client, &clientsize); //actual socket
+        char host[NI_MAXHOST];
+        char service[NI_MAXSERV]; 
+        ZeroMemory(host, NI_MAXHOST);
+        ZeroMemory(service, NI_MAXSERV);
+        if (getnameinfo((sockaddr*)&client, sizeof(client), host, NI_MAXHOST, service,
+        NI_MAXSERV, 0) == 0) {
+            cout << host << "connected on port " << service << endl;
+        }
+        else { 
+            inet_ntop(AF_INET, &client.sin_addr, host, NI_MAXHOST);
+            cout << host << " connected on port " <<
+            ntohs(client.sin_port) << endl;
+        }
+
+        //close listening socket
+        closesocket(listening);
+        char buf[4096];
+        while (true) {
+            ZeroMemory(buf, 4096);
+            //wait for client to send data
+            int bytesReceived = recv(clientSocket, buf, 4096, 0);
+            if (bytesReceived == SOCKET_ERROR) {
+                cerr << "Error in recv(). Quitting" << endl;
+                break;
+            }
+            if (bytesReceived == 0) {
+                cout << "client disconnected " << endl;
+                break;
+            }
+            send(clientSocket, buf, bytesReceived + 1, 0); //echo back
+        }
+        //close the socket
+        closesocket(clientSocket);
+        //cleanup winsock
+        WSACleanup();
+
+        //Send and receive
+        //Do-While loop to send and receive data
+        char buf[4096]; //all TCP sockets require a buffer space on both sending and receiving sides to hold data
+        string userInput;
+        do {
+                //prompt the user for some text
+                cout << "> ";
+                getline(cin, userInput); //get the whole line store into userInput
+                int sendResult = send(sock, userInput.c_str(), userInput.size() + 1, 0); //remember the size of network array of array is string size +1
+                //The message has to be changed into const char *
+                //0 is a standard number for TCP
+
+                if (sendResult != SOCKET_ERROR) {
+                        ZeroMemory(buf, 4096); //clear the buffer area, put zeros to locaiton starting at address buf, with size 4096
+                        int byteReceived = recv(sock, buf, 4094, 0); //Put received messages in buf
+                        if (byteReceived > 0) {
+                                cout << "SERVER> " << string(buf, 0, byteReceived) << endl; //0, byteReceived is the range of received message
+                        }
+                }
+        } while (userInput.size() > 0);
+        //Gracefully close down everything
+        closesocket(sock); //close local socket side
+        WSACleanup();
+}
+
 int main()
 {
     tbegin = chrono::system_clock::now();
@@ -180,6 +269,8 @@ int main()
         ele[i] = thread(elevator_process, E[i], i);
     }
     scheduler = thread(schedule);
+
+    tcp_connection();
 
     for(int i = 0; i < 2; i++){
         passenger_generate[i].join();
