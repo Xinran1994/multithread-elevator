@@ -1,0 +1,619 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <iostream>
+#include <chrono>
+#include <vector>
+#include <string>
+#include <map>
+#include <list>
+#include <time.h>
+#include <random>
+#include <sstream>
+#include <mutex>
+#include <fstream>
+#include <thread>
+#include <WS2tcpip.h> //Window Socket version 2 for TCPIP
+#pragma comment(lib, "ws2_32.lib")
+
+
+using namespace std;
+
+using Us = std::chrono::milliseconds;
+chrono::system_clock::time_point tbegin;
+mutex m1;
+
+int port = 54000;
+int max_floor = 30; 
+int min_floor = 1;
+const int elevator_number = 4;
+int passenger_interval = 3000;
+int elevator_interval = 400;
+int check_interval = 100;
+int load_unload_interval = 1000;
+int target = 6;
+int capacity = 7;
+int num_floor = 30;
+enum status { up, down, idle };
+enum direction { u, d };
+
+map<int, mutex*> building_waitinglist;
+int cur_time;
+int total_generated;
+int total_completed;
+bool finish = false;
+
+class passenger
+{
+    int id;
+    chrono::system_clock::time_point generate_time;
+    int start_floor;
+    int end_floor;
+    chrono::system_clock::time_point load_time;
+    chrono::system_clock::time_point unload_time;
+    direction d;
+
+public:
+    passenger(chrono::system_clock::time_point generate_time, int id, int start_floor, int end_floor);
+    ~passenger();
+
+    int get_start_floor();
+    int get_end_floor();
+    direction get_direction();
+    chrono::system_clock::time_point get_generate_time();
+    chrono::system_clock::time_point get_load_time();
+    chrono::system_clock::time_point get_unload_time();
+    void set_unload_time(chrono::system_clock::time_point time);
+    void set_load_time(chrono::system_clock::time_point time);
+    void print_passenger();
+};
+passenger::passenger(chrono::system_clock::time_point generate_time, int id, int start_floor, int end_floor) {
+    this->start_floor = start_floor;
+    this->end_floor = end_floor;
+    this->id = id;
+    this->generate_time = generate_time;
+    if (start_floor < end_floor) {
+        this->d = u;
+    }
+    else {
+        this->d = d;
+    }
+}
+passenger::~passenger() {}
+
+chrono::system_clock::time_point passenger::get_generate_time() {
+    return this->generate_time;
+}
+chrono::system_clock::time_point passenger::get_load_time() {
+    return this->load_time;
+}
+chrono::system_clock::time_point passenger::get_unload_time() {
+    return this->unload_time;
+}
+
+int passenger::get_start_floor() {
+    return this->start_floor;
+}
+direction passenger::get_direction() {
+    return this->d;
+}
+
+int passenger::get_end_floor() {
+    return this->end_floor;
+}
+
+void passenger::set_unload_time(chrono::system_clock::time_point time) {
+    this->unload_time = time;
+}
+
+void passenger::set_load_time(chrono::system_clock::time_point time) {
+    this->load_time = time;
+}
+
+void passenger::print_passenger() {
+    auto now = chrono::system_clock::now();
+    cout << "time : " << (chrono::duration_cast<std::chrono::microseconds>(now - tbegin).count()) << " passenger " << this->id << " generate, from " << this->start_floor << " floor to " << this->end_floor << " floor" << endl;
+    cout << "load time: " << (chrono::duration_cast<std::chrono::microseconds>(this->load_time - tbegin).count()) << ", unload_time: " << (chrono::duration_cast<std::chrono::microseconds>(this->unload_time - tbegin).count()) << endl;
+}
+
+map<int, vector<passenger*>> passengers_list;
+
+class elevator {
+    int id;
+    int max_passenger;
+    int finished_requests;
+    int cur_floor;
+    int cur_passengers;
+    int load_time = 5000;
+    status s;
+    int target_up_floor = 0;
+    int target_down_floor = 31;
+    list<passenger*> cur_queue; //elevator queue, passengers in elevator
+    //list<passenger*> finished_request;
+
+
+public:
+    elevator(int id);
+    ~elevator();
+    void load();
+    void unload();
+    status get_status();
+    int get_id();
+    list<passenger*> get_curqueue();
+    int get_cur_floor() { return cur_floor; }
+    void going_up();
+    void going_down();
+    void is_idle();
+    void set_target_down(int start_floor);
+    void set_target_up(int start_floor);
+    void print_elevator();
+};
+elevator::elevator(int id) {
+    this->id = id;
+    this->max_passenger = 7;
+    this->s = idle;
+    this->cur_floor = 1; // starting at floor 1
+    this->finished_requests = 0;
+
+}
+
+elevator::~elevator() {}
+
+status elevator::get_status() {
+    return this->s;
+}
+
+int elevator::get_id() {
+    return this->id;
+}
+
+list<passenger*> elevator::get_curqueue() {
+    return this->cur_queue;
+}
+void elevator::is_idle() {
+    if (target_up_floor != 0) {
+        this->s = up;
+        this->load();
+
+    }
+    if (target_down_floor != 31) {
+        this->s = down;
+        this->load();
+    }
+}
+
+void elevator::load() {
+    auto floor = this->cur_floor;
+    auto lock = building_waitinglist[floor]; // mutex*
+    lock->lock();
+    vector<passenger*> new_passengers_list; // update passengers in the waitinglist
+    auto old_list = passengers_list[floor]; // vector<passenger*>
+    int cur_load_number = 0;
+    for (auto p : old_list) {
+        if (this->cur_queue.size() >= max_passenger) { //capacity full
+            new_passengers_list.push_back(p);
+            continue;
+        }
+        if (p->get_end_floor() > floor && this-> s == up) { //same direction
+            this->cur_queue.push_back(p);
+            this->set_target_up(p->get_end_floor());
+            p->set_load_time(chrono::system_clock::now());
+
+            cur_load_number++;
+        }
+        else if (p->get_end_floor() < floor&& this->s == down) { //same direction
+            this->cur_queue.push_back(p);
+            this->set_target_down(p->get_end_floor());
+            p->set_load_time(chrono::system_clock::now());
+            cur_load_number++;
+        }
+        else {
+            new_passengers_list.push_back(p);
+        }
+    }
+
+    this_thread::sleep_for(Us(cur_load_number * 1000));
+    passengers_list.insert ({floor, new_passengers_list});
+    lock->unlock();
+}
+vector<passenger*> finished;
+mutex finished_lock;
+
+void elevator::unload() {
+    auto floor = this->cur_floor;
+    auto lock = building_waitinglist[floor];
+    list<passenger*> new_cur_queue; //update passengers in the elevator
+    int cur_unload_number = 0;
+    list<passenger*> cur_finfish;
+    for (auto p : cur_queue) {
+        if (p->get_end_floor() == floor) {
+            //finished_request.push_back(p);
+            p->set_unload_time(chrono::system_clock::now());
+            cur_finfish.push_back(p);
+            cur_passengers--;
+            finished_requests++;
+            cur_unload_number++;
+        }
+        else {
+            new_cur_queue.push_back(p);
+        }
+    }
+    this_thread::sleep_for(Us(1000 * cur_unload_number));
+    this->cur_queue = new_cur_queue;
+    for (auto request : cur_finfish) {
+        finished_lock.lock();
+        finished.push_back(request);
+        if (finished.size() == target) {
+            finish = true;
+        }
+        finished_lock.unlock();
+    }
+}
+
+void elevator::going_up() {
+    cur_floor++;
+    if (this->cur_floor == target_up_floor || this->cur_floor == max_floor) {
+        this->target_up_floor = 0;
+        if (this->target_down_floor != 31) {
+            this->s = down;
+            this->load();
+        }
+        else {
+            this->s = down;
+            this->load();
+            if (this->cur_queue.size() == 0) {
+                this->s = idle;
+            }
+        }
+    }
+    else {
+        this->load();
+        this->unload();
+    } 
+}
+
+void elevator::going_down() {
+    cur_floor--;
+    if (this->cur_floor == target_down_floor || this->cur_floor == min_floor) { 
+        this->target_down_floor = 31;
+        if (this->target_up_floor == 0) {
+            this->s = up;
+            this->load();
+        }
+        else {
+            this->s = up;
+            this->load();
+            if (this->cur_queue.size() == 0) {
+                this->s = idle;
+            }
+        }
+    }
+    else {
+        
+        this->load();
+        this->unload();
+    }
+}
+
+void elevator::set_target_down(int start_floor) {
+    this->target_down_floor = min(this->target_down_floor, start_floor);
+}
+
+void elevator::set_target_up(int start_floor) {
+    this->target_up_floor = max(this->target_up_floor, start_floor);
+}
+
+void elevator::print_elevator() {
+    auto now = chrono::system_clock::now();
+    cout << "time : " << (chrono::duration_cast<std::chrono::microseconds>(now - tbegin).count());
+    cout << ", elevator " << this->id;
+    cout << " have " << this->cur_queue.size() << " passengers ";
+    cout << ", floor " << this->cur_floor;
+    cout << ", completed " << this->finished_requests << " requests"<< endl;
+   
+}
+
+vector<elevator*> E;
+
+void schedule(elevator* el, passenger* p) {
+    int cur_floor = el->get_cur_floor();
+    int start_floor = p->get_start_floor();
+    if (cur_floor > start_floor) { //going down target
+        el->set_target_down(start_floor);
+    }
+    else {
+        el->set_target_up(start_floor);
+    }
+}
+
+int calculate_distance(elevator* el, passenger* p) {
+    //auto el = ele;
+    int distance = INT_MAX;
+    int cur_floor = el->get_cur_floor();
+    int end_floor = p->get_end_floor();
+    int start_floor = p->get_start_floor();
+    bool going_up = start_floor < end_floor;
+    if (going_up) {
+        if (el->get_status() == up) {
+            if (start_floor > cur_floor) {
+                distance = start_floor - cur_floor;
+            }
+            else {
+                distance = max_floor - cur_floor + max_floor - start_floor;
+            }
+        }
+        else if (el->get_status() == down) {
+            distance = cur_floor - min_floor + start_floor - min_floor;
+        }
+        else {
+            distance = abs(cur_floor - start_floor);
+        }
+    }
+    else {
+        if (el->get_status() == down) {
+            if (start_floor < cur_floor) {
+                distance = cur_floor - start_floor;
+            }
+            else {
+                distance = cur_floor - min_floor + start_floor;
+            }
+        }
+        else if (el->get_status() == up) {
+            distance = max_floor - cur_floor + max_floor - start_floor;
+        }
+        else {
+            distance = abs(cur_floor - start_floor);
+        }
+    }
+    return distance;
+}
+
+void generate_p() { // generating passenger
+
+    int id = 0;
+    while (total_generated != target) {
+        random_device rd;
+        default_random_engine e{ rd() };
+        uniform_int_distribution<unsigned> u(1, 30);
+        int start_floor = u(e);
+        int end_floor = u(e);
+        auto lock_floor = building_waitinglist[start_floor];
+        auto p = new passenger(chrono::system_clock::now(), id, start_floor, end_floor); // generate a random passenger
+       // p->print_passenger();
+        lock_floor->lock();
+        passengers_list.at(start_floor).push_back(p);
+        lock_floor->unlock();
+
+        //find a closest elevator
+        int distance = calculate_distance(E[0], p);
+        elevator* picked_elevator = E[0];
+        for (int i = 1; i < E.size(); i++) {
+            if (calculate_distance(E[i], p) < distance) {
+                picked_elevator = E[i];
+            }
+        }
+        schedule(picked_elevator, p);
+        total_generated++;
+        id++;
+        this_thread::sleep_for(Us(passenger_interval));
+    }
+}
+
+void scheduler() {
+    if (!finish) {
+        for (int i = min_floor; i <= max_floor; i++) {
+            for (auto p : passengers_list[i]) {
+                int distance = calculate_distance(E[0], p);
+                elevator* picked_elevator = E[0];
+                for (int i = 1; i < E.size(); i++) {
+                    int cur_dist = calculate_distance(E[i], p);
+                    if (cur_dist < distance) {
+                        picked_elevator = E[i];
+                        distance = cur_dist;
+                    }
+                }
+                schedule(picked_elevator, p);
+            }
+        }
+        this_thread::sleep_for(Us(6000));
+    }
+}
+
+void elevator_process(elevator* el, int id) {
+    cout << "************************elevator " << id << " start serving !!!****************************" << endl;
+    while (!finish) { //haven't finish all request
+        if (el->get_status() == up) { //el is up
+            el->going_up();
+        }
+        else if (el->get_status() == down) { // el is down
+            el->going_down();
+        }
+        else { //el is idle
+            el->is_idle();
+        }
+        this_thread::sleep_for(Us(elevator_interval));
+    }
+    cout << "elevator " << id << "exit !!!"<<endl;
+}
+string _info() {
+    stringstream ss;
+
+    for (auto el : E) {
+        ss << el->get_id() << "," <<
+            el->get_cur_floor() << "," <<
+            el->get_status() << "," <<
+            el->get_curqueue().size() << ",";
+        for (auto p : el->get_curqueue()) {
+            ss << p->get_start_floor() << ",";
+            ss << p->get_end_floor() << ",";
+            ss << p->get_direction() << ",";
+        }
+    }
+
+    ss << finished.size() << ",";
+
+    for (int i = min_floor; i <= max_floor; i++) {
+        auto floor_orders = passengers_list[i];
+        ss << floor_orders.size() << ",";
+        for (auto order : floor_orders) {
+            ss << order->get_end_floor() << ",";
+        }
+    }
+
+    ss << max_floor << "," <<
+        min_floor << "," <<
+        num_floor << "," <<
+        elevator_number << "," <<
+        capacity << "," <<
+        target << ",";
+    return ss.str();
+}
+
+void tcp_connection() {
+    //Initialize Window socket environment
+    WSAData data;
+    WORD ver = MAKEWORD(2, 2); 
+    int wsResult = WSAStartup(ver, &data);
+    if (wsResult != 0) { // value 0 will be returned if the initialization succeeds.
+        cerr << "Can't start winsock, Err #" << wsResult << endl;
+        WSACleanup(); //Clean up Windows socket environment.
+        return;
+    }
+    //create socket
+    SOCKET listening = socket(AF_INET, SOCK_STREAM, 0);
+    if (listening == INVALID_SOCKET) { //-1
+        cerr << "Can't create a socket" << endl;
+    }
+
+    //Bind the socket
+    sockaddr_in hint;
+    hint.sin_family = AF_INET;
+    hint.sin_port = htons(54000);
+    hint.sin_addr.s_addr = INADDR_ANY;
+    bind(listening, (sockaddr*)&hint, sizeof(hint));
+    listen(listening, SOMAXCONN);
+
+    sockaddr_in client;
+    int clientsize = sizeof(client);
+    SOCKET clientSocket = accept(listening, (sockaddr*)&client, &clientsize); //actual socket
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    ZeroMemory(host, NI_MAXHOST);
+    ZeroMemory(service, NI_MAXSERV);
+    if (getnameinfo((sockaddr*)&client, sizeof(client), host, NI_MAXHOST, service,
+        NI_MAXSERV, 0) == 0) {
+        cout << host << "connected on port " << service << endl;
+    }
+    else {
+        inet_ntop(AF_INET, &client.sin_addr, host, NI_MAXHOST);
+        cout << host << " connected on port " <<
+            ntohs(client.sin_port) << endl;
+    }
+
+    //close listening socket
+    closesocket(listening);
+    bool is_first = true;
+    char buf[4096];
+    while (true) {
+        ZeroMemory(buf, 4096);
+        //wait for client to send data
+        int bytesReceived = recv(clientSocket, buf, 4096, 0);
+        if (bytesReceived == SOCKET_ERROR) {
+            cerr << "Error in recv(). Quitting" << endl;
+            closesocket(clientSocket);
+            closesocket(listening);
+            WSACleanup();
+            finish = true;
+            return;
+        }
+        if (bytesReceived == 0) {
+            cout << "client disconnected " << endl;
+            cout << "closing server" << endl;
+            closesocket(clientSocket);
+            closesocket(listening);
+            WSACleanup();
+            finish = true;
+            return;
+        }
+
+         send(clientSocket, _info().c_str(), _info().length() + 1, 0);
+
+    }
+    //Gracefully close down everything
+    closesocket(clientSocket); //close local socket side
+    WSACleanup();
+}
+void analysis() {
+    ofstream file;
+    file.open("analysis.csv", std::ofstream::trunc);
+    for (auto p : finished) {
+        file << (chrono::duration_cast<std::chrono::microseconds>(p->get_generate_time() - tbegin).count()) << "," <<
+            (chrono::duration_cast<std::chrono::microseconds>(p->get_load_time() - tbegin).count()) << "," <<
+            (chrono::duration_cast<std::chrono::microseconds>(p->get_unload_time() - tbegin).count()) << "\n";
+    }
+    file.flush();
+    file.close();
+}
+int main(int argc, char** argv)
+{
+    for (int i = 0; i < max_floor; i++) {
+        mutex* m = new mutex();
+        building_waitinglist.insert({ i + 1, m });
+    }
+    for (int i = 0; i < max_floor; i++) {
+        vector<passenger*> list;
+        passengers_list.insert({ i + 1, list });
+    }
+
+    tbegin = chrono::system_clock::now();
+    for (int i = 0; i < 4; i++) { // push all elevator carts into the vector
+        auto e = new elevator(i);
+        E.push_back(e);
+    }
+    thread ele[elevator_number];
+    thread passenger_generate;
+    thread schedulerth;
+   // thread connection = thread(tcp_connection);
+
+    cout << "-----------running the simulation----------\n";
+    cout << "---------------start serving---------------\n";
+
+    passenger_generate = thread(generate_p);
+
+    for (int i = 0; i < elevator_number; i++) {
+        ele[i] = thread(elevator_process, E[i], i);
+    }
+    schedulerth = thread(scheduler);
+
+    while (!finish) {
+
+        for (auto el : E) {
+            el->print_elevator();
+        }
+        cout << " total_generated order" << total_generated << endl;
+        cout << " total_finished order" << finished.size() << endl;
+        cout << endl;
+        if (finished.size() == target) {
+            finish = true;
+            break;
+        }
+        this_thread::sleep_for(Us(check_interval));
+        if (finished.size() == target) {
+            finish = true;
+            break;
+        }
+    }
+
+    passenger_generate.join();
+
+    for (int i = 0; i < elevator_number; i++) {
+        ele[i].join();
+    }
+    schedulerth.join();
+    //connection.join();
+    analysis();
+
+    cout << "Total generated request: " << total_generated << endl;
+    cout << "Total completed request: " << finished.size() << endl;
+    cout << "-------------------Finish!!!--------------------" << endl;
+    return 0;
+}
